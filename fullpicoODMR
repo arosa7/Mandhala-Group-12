@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
 """
-odmr_sweep_pico_only.py
+odmr_field_sweep.py
 
-PC-driven ODMR sweep where the Pico does both:
-- set ADF4351 microwave frequency
-- read TSL2591 and perform OFF1 -> ON -> OFF2 measurement
+Integrated ODMR experiment:
+  - Arduino (COM5): controls two stepper motors (Halbach ring)
+  - Pico (COM7): controls ADF4351 microwave + TSL2591 light sensor
 
-PC sends:
-    MEAS <freq_hz>
+Experiment flow:
+  1. Set outer ring (X motor) to angle
+  2. Pico does full ODMR frequency sweep → get Zeeman split peaks
+  3. Rotate outer ring by ANGLE_STEP degrees
+  4. Repeat until full rotation
 
-Pico replies:
-    RESULT,freq_hz,off1,on,off2,off_ref,delta,contrast,drift
-
-Example:
-    RESULT,2870000000,12345.0,12210.0,12340.0,12342.5,-132.5,-0.010735,-5.0
-
-Requires:
-    pip install pyserial numpy matplotlib
+Output:
+  - CSV file with all data
+  - Plot of ODMR spectrum at each angle
 """
 
 import time
 import csv
 import re
+import sys
 from typing import Optional, Tuple, List
 
 import numpy as np
@@ -30,120 +29,159 @@ import serial
 
 
 # ========================== USER SETTINGS ==========================
-PORT = "COM19"
-BAUD = 115200
-TIMEOUT_S = 2.0
 
+# --- Serial ports ---
+ARDUINO_PORT = "COM5"       # Arduino (motor control)
+PICO_PORT    = "COM7"       # Pico (NV center measurement)
+BAUD         = 115200
+TIMEOUT_S    = 2.0
+
+# --- Motor settings ---
+ANGLE_START  = 0            # Starting angle (degrees)
+ANGLE_STOP   = 350          # Last angle (degrees)
+ANGLE_STEP   = 10           # Step size (degrees)
+Y_ANGLE      = 0            # Inner ring (Y motor) stays fixed
+
+# --- ODMR frequency sweep ---
+F_START_HZ   = 2.8e9
+F_STOP_HZ    = 2.94e9
+F_STEP_HZ    = 0.01e9
+
+N_REPEATS_PER_FREQ = 1
+MEAS_TIMEOUT_S     = 25.0
+
+# --- Pico DTR/RTS ---
 ASSERT_DTR = True
 ASSERT_RTS = False
 
-F_START_HZ = 2.8e9
-F_STOP_HZ = 2.94e9
-F_STEP_HZ = 0.01e9
+# --- Output ---
+CSV_PATH = "odmr_field_sweep.csv"
+PLOT     = True
 
-# Number of repeated MEAS commands to send at each frequency
-N_REPEATS_PER_FREQ = 1
+# --- Wait time after motor move (seconds) ---
+MOTOR_SETTLE_TIME_S = 2.0
 
-# Timeout waiting for one RESULT line from Pico
-MEAS_TIMEOUT_S = 25.0
-
-CSV_PATH = "noField.csv"
-PLOT = True
-PRINT_EACH_MEASUREMENT = True
-PRINT_FREQ_SUMMARY = True
 # ==================================================================
 
 
 RE_RESULT = re.compile(
     r"^\s*RESULT\s*,\s*"
-    r"(\d+)\s*,\s*"                        # freq_hz
-    r"([+-]?\d+(?:\.\d+)?)\s*,\s*"        # off1
-    r"([+-]?\d+(?:\.\d+)?)\s*,\s*"        # on
-    r"([+-]?\d+(?:\.\d+)?)\s*,\s*"        # off2
-    r"([+-]?\d+(?:\.\d+)?)\s*,\s*"        # off_ref
-    r"([+-]?\d+(?:\.\d+)?)\s*,\s*"        # delta
-    r"([+-]?\d+(?:\.\d+)?)\s*,\s*"        # contrast
-    r"([+-]?\d+(?:\.\d+)?)\s*$",          # drift
-    re.IGNORECASE
+    r"(\d+)\s*,\s*"
+    r"([+-]?\d+(?:\.\d+)?)\s*,\s*"
+    r"([+-]?\d+(?:\.\d+)?)\s*,\s*"
+    r"([+-]?\d+(?:\.\d+)?)\s*,\s*"
+    r"([+-]?\d+(?:\.\d+)?)\s*,\s*"
+    r"([+-]?\d+(?:\.\d+)?)\s*,\s*"
+    r"([+-]?\d+(?:\.\d+)?)\s*,\s*"
+    r"([+-]?\d+(?:\.\d+)?)\s*$",
+    re.IGNORECASE,
 )
 
 
-def open_serial_port() -> serial.Serial:
+# ========================== ARDUINO (MOTOR) ==========================
+
+def open_arduino(port: str) -> serial.Serial:
+    """Open Arduino serial port and wait for Ready."""
+    print(f"[ARDUINO] Opening {port} ...")
+    ser = serial.Serial(port, BAUD, timeout=TIMEOUT_S)
+    time.sleep(2.0)  # Wait for Arduino reset
+
+    # Drain startup messages, look for "Ready"
+    t0 = time.time()
+    ready = False
+    while (time.time() - t0) < 5.0:
+        raw = ser.readline()
+        if not raw:
+            continue
+        line = raw.decode("utf-8", errors="replace").strip()
+        if line:
+            print(f"[ARDUINO] {line}")
+        if "Ready" in line or "ready" in line:
+            ready = True
+            break
+
+    if not ready:
+        print("[ARDUINO] Warning: did not see 'Ready' message, continuing anyway...")
+
+    return ser
+
+
+def move_motor(ser: serial.Serial, x_angle: float, y_angle: float) -> None:
+    """
+    Send angle command to Arduino and wait for 'Done.' response.
+    Format: "x_angle,y_angle"  e.g. "90,0"
+    """
+    cmd = f"{x_angle:.1f},{y_angle:.1f}\n"
+    print(f"[ARDUINO] Sending: {cmd.strip()}")
+
+    ser.reset_input_buffer()
+    ser.write(cmd.encode("utf-8"))
+    ser.flush()
+
+    # Wait for "Done." response
+    t0 = time.time()
+    while (time.time() - t0) < 60.0:  # 60s timeout for motor movement
+        raw = ser.readline()
+        if not raw:
+            continue
+        line = raw.decode("utf-8", errors="replace").strip()
+        if line:
+            print(f"[ARDUINO] {line}")
+        if "Done" in line:
+            return
+
+    print("[ARDUINO] Warning: did not receive 'Done' confirmation")
+
+
+# ========================== PICO (NV CENTER) ==========================
+
+def open_pico(port: str) -> serial.Serial:
+    """Open Pico serial port."""
+    print(f"[PICO] Opening {port} ...")
     ser = serial.Serial(
-        PORT,
-        BAUD,
+        port, BAUD,
         timeout=TIMEOUT_S,
         write_timeout=TIMEOUT_S,
-        rtscts=False,
-        dsrdtr=False,
-        xonxoff=False,
+        rtscts=False, dsrdtr=False, xonxoff=False,
     )
 
     try:
         ser.setDTR(ASSERT_DTR)
         ser.setRTS(ASSERT_RTS)
     except Exception as e:
-        print("Warning: couldn't set DTR/RTS:", e)
+        print(f"[PICO] Warning: couldn't set DTR/RTS: {e}")
 
-    # Give Pico time to reset/enumerate if opening the port resets it
     time.sleep(2.0)
 
-    try:
-        ser.reset_input_buffer()
-        ser.reset_output_buffer()
-    except Exception:
-        pass
+    # Drain startup messages
+    t0 = time.time()
+    while (time.time() - t0) < 1.0:
+        try:
+            raw = ser.readline()
+            if raw:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if line:
+                    print(f"[PICO] {line}")
+        except Exception:
+            pass
 
     return ser
 
 
-def drain_serial(ser: serial.Serial, seconds: float = 0.3) -> None:
-    t0 = time.time()
-    while (time.time() - t0) < seconds:
-        try:
-            raw = ser.readline()
-            if not raw:
-                continue
-            line = raw.decode("utf-8", errors="replace").strip()
-            if line:
-                print(f"[PICO] {line}")
-        except Exception:
-            pass
-
-
-def build_frequency_list(start_hz: float, stop_hz: float, step_hz: float) -> np.ndarray:
-    n = int(round((stop_hz - start_hz) / step_hz)) + 1
-    return start_hz + step_hz * np.arange(n, dtype=np.float64)
-
-
-def parse_result_line(line: str) -> Optional[Tuple[float, float, float, float, float, float, float, float]]:
+def parse_result_line(line: str) -> Optional[Tuple]:
     m = RE_RESULT.match(line)
     if not m:
         return None
-
-    freq_hz = float(m.group(1))
-    off1 = float(m.group(2))
-    on = float(m.group(3))
-    off2 = float(m.group(4))
-    off_ref = float(m.group(5))
-    delta = float(m.group(6))
-    contrast = float(m.group(7))
-    drift = float(m.group(8))
-
-    return (freq_hz, off1, on, off2, off_ref, delta, contrast, drift)
+    return tuple(float(m.group(i)) for i in range(1, 9))
 
 
-def send_measurement_command(ser: serial.Serial, freq_hz: float) -> None:
+def send_meas(ser: serial.Serial, freq_hz: float) -> None:
     cmd = f"MEAS {int(round(freq_hz))}\n"
     ser.write(cmd.encode("utf-8"))
     ser.flush()
 
 
-def wait_for_result(ser: serial.Serial, expected_freq_hz: float, timeout_s: float = 10.0):
-    """
-    Wait for a RESULT line from the Pico.
-    Ignores unrelated lines, but prints them for debugging.
-    """
+def wait_for_result(ser: serial.Serial, expected_freq_hz: float, timeout_s: float = 25.0):
     t0 = time.time()
     expected = int(round(expected_freq_hz))
 
@@ -151,7 +189,6 @@ def wait_for_result(ser: serial.Serial, expected_freq_hz: float, timeout_s: floa
         raw = ser.readline()
         if not raw:
             continue
-
         line = raw.decode("utf-8", errors="replace").strip()
         if not line:
             continue
@@ -161,142 +198,163 @@ def wait_for_result(ser: serial.Serial, expected_freq_hz: float, timeout_s: floa
             print(f"[PICO] {line}")
             continue
 
-        freq_hz, off1, on, off2, off_ref, delta, contrast, drift = parsed
-
-        if int(round(freq_hz)) != expected:
-            print(f"[PICO] Warning: got result for unexpected frequency {freq_hz:.0f} Hz")
+        if int(round(parsed[0])) != expected:
+            print(f"[PICO] Warning: unexpected freq {parsed[0]:.0f} Hz")
             continue
 
         return parsed
 
-    raise TimeoutError(f"Timed out waiting for RESULT for {expected} Hz")
+    raise TimeoutError(f"Timed out waiting for RESULT at {expected} Hz")
 
+
+def do_odmr_sweep(pico_ser: serial.Serial, freqs_hz: np.ndarray) -> List[Tuple]:
+    """Run a complete ODMR frequency sweep, return list of result tuples."""
+    results = []
+
+    for freq_hz in freqs_hz:
+        send_meas(pico_ser, freq_hz)
+        result = wait_for_result(pico_ser, freq_hz, timeout_s=MEAS_TIMEOUT_S)
+
+        freq, off1, on, off2, off_ref, delta, contrast, drift = result
+        print(
+            f"  {freq / 1e9:.4f} GHz | "
+            f"OFF_REF={off_ref:.4g} Δ={delta:+.3e} "
+            f"contrast={contrast:+.3e}"
+        )
+        results.append(result)
+
+    return results
+
+
+# ========================== MAIN ==========================
 
 def main():
-    freqs_hz = build_frequency_list(F_START_HZ, F_STOP_HZ, F_STEP_HZ)
+    # Build lists
+    angles = np.arange(ANGLE_START, ANGLE_STOP + 1, ANGLE_STEP, dtype=float)
+    freqs_hz = np.arange(F_START_HZ, F_STOP_HZ + F_STEP_HZ / 2, F_STEP_HZ)
 
-    print(f"Opening Pico serial {PORT} @ {BAUD} ...")
-    ser = open_serial_port()
-    drain_serial(ser, 1.0)
-
-    freq_mean_delta = np.full(len(freqs_hz), np.nan, dtype=np.float64)
-    freq_sem_delta = np.full(len(freqs_hz), np.nan, dtype=np.float64)
-
+    n_angles = len(angles)
     n_freqs = len(freqs_hz)
-    total_meas = n_freqs * N_REPEATS_PER_FREQ
-    est_runtime_s = total_meas * MEAS_TIMEOUT_S/6
+    total_meas = n_angles * n_freqs * N_REPEATS_PER_FREQ
 
-    print(
-        f"Planned run: {n_freqs} frequencies, "
-        f"{N_REPEATS_PER_FREQ} repeats/frequency, "
-        f"{total_meas} total measurements"
-    )
-    print(
-        f"Estimated worst-case runtime: "
-        f"{est_runtime_s / 60:.1f} min "
-        f"({est_runtime_s / 3600:.2f} hr)"
-    )
-    with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "freq_hz",
-            "repeat_idx",
-            "off1",
-            "on",
-            "off2",
-            "off_ref",
-            "delta_on_minus_offref",
-            "contrast_on_minus_offref_over_offref",
-            "drift_off2_minus_off1",
-        ])
+    print("=" * 60)
+    print("  ODMR Field Sweep - NV Center Experiment")
+    print("=" * 60)
+    print(f"  Motor angles: {ANGLE_START}° to {ANGLE_STOP}° step {ANGLE_STEP}° ({n_angles} positions)")
+    print(f"  Freq sweep:   {F_START_HZ/1e9:.3f} - {F_STOP_HZ/1e9:.3f} GHz, step {F_STEP_HZ/1e6:.1f} MHz ({n_freqs} points)")
+    print(f"  Repeats/freq: {N_REPEATS_PER_FREQ}")
+    print(f"  Total measurements: {total_meas}")
+    print(f"  Output: {CSV_PATH}")
+    print("=" * 60)
+
+    # Open both serial ports
+    arduino_ser = open_arduino(ARDUINO_PORT)
+    pico_ser = open_pico(PICO_PORT)
+
+    # Prepare CSV
+    csvfile = open(CSV_PATH, "w", newline="", encoding="utf-8")
+    writer = csv.writer(csvfile)
+    writer.writerow([
+        "angle_deg",
+        "freq_hz",
+        "repeat_idx",
+        "off1", "on", "off2", "off_ref",
+        "delta", "contrast", "drift",
+    ])
+
+    # Storage for plotting
+    all_data = {}  # angle -> (freqs, deltas)
+
+    try:
+        for ai, angle in enumerate(angles):
+            print(f"\n{'='*60}")
+            print(f"  Angle {ai+1}/{n_angles}: X = {angle}° (Y = {Y_ANGLE}°)")
+            print(f"{'='*60}")
+
+            # Move motor
+            move_motor(arduino_ser, angle, Y_ANGLE)
+            print(f"[MOTOR] Settling for {MOTOR_SETTLE_TIME_S}s ...")
+            time.sleep(MOTOR_SETTLE_TIME_S)
+
+            # ODMR sweep at this angle
+            deltas = []
+            for repeat_idx in range(N_REPEATS_PER_FREQ):
+                if N_REPEATS_PER_FREQ > 1:
+                    print(f"\n  --- Repeat {repeat_idx+1}/{N_REPEATS_PER_FREQ} ---")
+
+                results = do_odmr_sweep(pico_ser, freqs_hz)
+
+                for result in results:
+                    freq, off1, on, off2, off_ref, delta, contrast, drift = result
+                    writer.writerow([
+                        f"{angle:.1f}",
+                        f"{freq:.0f}",
+                        repeat_idx,
+                        off1, on, off2, off_ref,
+                        delta, contrast, drift,
+                    ])
+                csvfile.flush()
+
+            # Store for plotting (last repeat)
+            freq_arr = np.array([r[0] for r in results])
+            delta_arr = np.array([r[5] for r in results])
+            all_data[angle] = (freq_arr, delta_arr)
+
+            print(f"\n  Angle {angle}° complete.")
+
+    except KeyboardInterrupt:
+        print("\n\n[!] Interrupted by user. Saving data...")
+
+    except Exception as e:
+        print(f"\n[!] Error: {e}")
+
+    finally:
+        csvfile.close()
+        print(f"\nData saved to {CSV_PATH}")
 
         try:
-            for fi, freq_hz in enumerate(freqs_hz):
-                print(f"\nRequesting measurements at {freq_hz / 1e9:.6f} GHz ...")
+            arduino_ser.close()
+        except Exception:
+            pass
+        try:
+            pico_ser.close()
+        except Exception:
+            pass
 
-                deltas_this_freq: List[float] = []
+    # Plot
+    if PLOT and all_data:
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 
-                for repeat_idx in range(N_REPEATS_PER_FREQ):
-                    send_measurement_command(ser, freq_hz)
+        # Left: All ODMR spectra overlaid
+        ax1 = axes[0]
+        cmap = plt.cm.viridis(np.linspace(0, 1, len(all_data)))
+        for i, (angle, (freqs, deltas)) in enumerate(sorted(all_data.items())):
+            ax1.plot(freqs / 1e9, deltas, color=cmap[i], label=f"{angle:.0f}°", alpha=0.7)
+        ax1.set_xlabel("Frequency (GHz)")
+        ax1.set_ylabel("Δ (ON - OFF_REF)")
+        ax1.set_title("ODMR Spectra at Different Field Angles")
+        ax1.legend(fontsize=6, ncol=3, loc="lower left")
+        ax1.grid(True)
 
-                    result = wait_for_result(ser, freq_hz, timeout_s=MEAS_TIMEOUT_S)
-                    result_freq_hz, off1, on, off2, off_ref, delta, contrast, drift = result
-
-                    if np.isfinite(delta):
-                        deltas_this_freq.append(delta)
-
-                    w.writerow([
-                        f"{result_freq_hz:.0f}",
-                        repeat_idx,
-                        off1,
-                        on,
-                        off2,
-                        off_ref,
-                        delta,
-                        contrast,
-                        drift,
-                    ])
-                    f.flush()
-
-                    if PRINT_EACH_MEASUREMENT:
-                        print(
-                            f"  rep {repeat_idx + 1:2d}/{N_REPEATS_PER_FREQ} | "
-                            f"OFF1={off1:.6g} ON={on:.6g} OFF2={off2:.6g} "
-                            f"OFF_REF={off_ref:.6g} Δ={delta:+.3e} "
-                            f"contrast={contrast:+.3e} drift={drift:+.3e}"
-                        )
-
-                d = np.asarray(deltas_this_freq, dtype=np.float64)
-                if d.size > 0:
-                    freq_mean_delta[fi] = float(np.mean(d))
-                    if d.size > 1:
-                        freq_sem_delta[fi] = float(np.std(d, ddof=1) / np.sqrt(d.size))
-                    else:
-                        freq_sem_delta[fi] = 0.0
-
-                if PRINT_FREQ_SUMMARY:
-                    print(
-                        f"Freq {freq_hz / 1e9:.6f} GHz summary: "
-                        f"mean Δ = {freq_mean_delta[fi]:+.6e}, "
-                        f"SEM = {freq_sem_delta[fi]:.6e}, "
-                        f"n = {d.size}"
-                    )
-
-        finally:
-            print("\nClosing serial...")
-            try:
-                ser.close()
-            except Exception:
-                pass
-
-    print(f"Saved {CSV_PATH}")
-
-    valid = np.isfinite(freq_mean_delta)
-    if not np.any(valid):
-        print("No valid sweep points collected.")
-        return
-
-    print("\nSweep summary:")
-    for f_hz, d_mean, d_sem in zip(freqs_hz, freq_mean_delta, freq_sem_delta):
-        print(f"  {f_hz / 1e9:.6f} GHz : mean Δ = {d_mean:+.6e}, SEM = {d_sem:.6e}")
-
-    if PLOT:
-        plt.figure(figsize=(8, 5))
-        plt.errorbar(
-            freqs_hz[valid] / 1e9,
-            freq_mean_delta[valid],
-            yerr=freq_sem_delta[valid],
-            fmt="o-",
-            capsize=4,
+        # Right: Heatmap (angle vs frequency)
+        ax2 = axes[1]
+        sorted_angles = sorted(all_data.keys())
+        heatmap_data = np.array([all_data[a][1] for a in sorted_angles])
+        extent = [freqs_hz[0]/1e9, freqs_hz[-1]/1e9, sorted_angles[0], sorted_angles[-1]]
+        im = ax2.imshow(
+            heatmap_data, aspect="auto", origin="lower", extent=extent,
+            cmap="RdBu_r",
         )
-        plt.xlabel("Frequency (GHz)")
-        plt.ylabel("Mean Δ = ON - OFF_REF")
-        plt.title(f"ODMR sweep mean Δ vs frequency (n={N_REPEATS_PER_FREQ})")
-        plt.grid(True)
+        ax2.set_xlabel("Frequency (GHz)")
+        ax2.set_ylabel("Outer Ring Angle (°)")
+        ax2.set_title("ODMR Δ Heatmap")
+        plt.colorbar(im, ax=ax2, label="Δ")
+
         plt.tight_layout()
+        plt.savefig("odmr_field_sweep.png", dpi=150)
+        print("Plot saved to odmr_field_sweep.png")
         plt.show()
 
 
 if __name__ == "__main__":
     main()
-
