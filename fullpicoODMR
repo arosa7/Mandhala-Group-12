@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""
+odmr_sweep_pico_only.py
+
+PC-driven ODMR sweep where the Pico does both:
+- set ADF4351 microwave frequency
+- read TSL2591 and perform OFF1 -> ON -> OFF2 measurement
+
+PC sends:
+    MEAS <freq_hz>
+
+Pico replies:
+    RESULT,freq_hz,off1,on,off2,off_ref,delta,contrast,drift
+
+Example:
+    RESULT,2870000000,12345.0,12210.0,12340.0,12342.5,-132.5,-0.010735,-5.0
+
+Requires:
+    pip install pyserial numpy matplotlib
+"""
+
+import time
+import csv
+import re
+from typing import Optional, Tuple, List
+
+import numpy as np
+import matplotlib.pyplot as plt
+import serial
+
+
+# ========================== USER SETTINGS ==========================
+PORT = "COM19"
+BAUD = 115200
+TIMEOUT_S = 2.0
+
+ASSERT_DTR = True
+ASSERT_RTS = False
+
+F_START_HZ = 2.8e9
+F_STOP_HZ = 2.94e9
+F_STEP_HZ = 0.01e9
+
+# Number of repeated MEAS commands to send at each frequency
+N_REPEATS_PER_FREQ = 1
+
+# Timeout waiting for one RESULT line from Pico
+MEAS_TIMEOUT_S = 25.0
+
+CSV_PATH = "noField.csv"
+PLOT = True
+PRINT_EACH_MEASUREMENT = True
+PRINT_FREQ_SUMMARY = True
+# ==================================================================
+
+
+RE_RESULT = re.compile(
+    r"^\s*RESULT\s*,\s*"
+    r"(\d+)\s*,\s*"                        # freq_hz
+    r"([+-]?\d+(?:\.\d+)?)\s*,\s*"        # off1
+    r"([+-]?\d+(?:\.\d+)?)\s*,\s*"        # on
+    r"([+-]?\d+(?:\.\d+)?)\s*,\s*"        # off2
+    r"([+-]?\d+(?:\.\d+)?)\s*,\s*"        # off_ref
+    r"([+-]?\d+(?:\.\d+)?)\s*,\s*"        # delta
+    r"([+-]?\d+(?:\.\d+)?)\s*,\s*"        # contrast
+    r"([+-]?\d+(?:\.\d+)?)\s*$",          # drift
+    re.IGNORECASE
+)
+
+
+def open_serial_port() -> serial.Serial:
+    ser = serial.Serial(
+        PORT,
+        BAUD,
+        timeout=TIMEOUT_S,
+        write_timeout=TIMEOUT_S,
+        rtscts=False,
+        dsrdtr=False,
+        xonxoff=False,
+    )
+
+    try:
+        ser.setDTR(ASSERT_DTR)
+        ser.setRTS(ASSERT_RTS)
+    except Exception as e:
+        print("Warning: couldn't set DTR/RTS:", e)
+
+    # Give Pico time to reset/enumerate if opening the port resets it
+    time.sleep(2.0)
+
+    try:
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+    except Exception:
+        pass
+
+    return ser
+
+
+def drain_serial(ser: serial.Serial, seconds: float = 0.3) -> None:
+    t0 = time.time()
+    while (time.time() - t0) < seconds:
+        try:
+            raw = ser.readline()
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line:
+                print(f"[PICO] {line}")
+        except Exception:
+            pass
+
+
+def build_frequency_list(start_hz: float, stop_hz: float, step_hz: float) -> np.ndarray:
+    n = int(round((stop_hz - start_hz) / step_hz)) + 1
+    return start_hz + step_hz * np.arange(n, dtype=np.float64)
+
+
+def parse_result_line(line: str) -> Optional[Tuple[float, float, float, float, float, float, float, float]]:
+    m = RE_RESULT.match(line)
+    if not m:
+        return None
+
+    freq_hz = float(m.group(1))
+    off1 = float(m.group(2))
+    on = float(m.group(3))
+    off2 = float(m.group(4))
+    off_ref = float(m.group(5))
+    delta = float(m.group(6))
+    contrast = float(m.group(7))
+    drift = float(m.group(8))
+
+    return (freq_hz, off1, on, off2, off_ref, delta, contrast, drift)
+
+
+def send_measurement_command(ser: serial.Serial, freq_hz: float) -> None:
+    cmd = f"MEAS {int(round(freq_hz))}\n"
+    ser.write(cmd.encode("utf-8"))
+    ser.flush()
+
+
+def wait_for_result(ser: serial.Serial, expected_freq_hz: float, timeout_s: float = 10.0):
+    """
+    Wait for a RESULT line from the Pico.
+    Ignores unrelated lines, but prints them for debugging.
+    """
+    t0 = time.time()
+    expected = int(round(expected_freq_hz))
+
+    while (time.time() - t0) < timeout_s:
+        raw = ser.readline()
+        if not raw:
+            continue
+
+        line = raw.decode("utf-8", errors="replace").strip()
+        if not line:
+            continue
+
+        parsed = parse_result_line(line)
+        if parsed is None:
+            print(f"[PICO] {line}")
+            continue
+
+        freq_hz, off1, on, off2, off_ref, delta, contrast, drift = parsed
+
+        if int(round(freq_hz)) != expected:
+            print(f"[PICO] Warning: got result for unexpected frequency {freq_hz:.0f} Hz")
+            continue
+
+        return parsed
+
+    raise TimeoutError(f"Timed out waiting for RESULT for {expected} Hz")
+
+
+def main():
+    freqs_hz = build_frequency_list(F_START_HZ, F_STOP_HZ, F_STEP_HZ)
+
+    print(f"Opening Pico serial {PORT} @ {BAUD} ...")
+    ser = open_serial_port()
+    drain_serial(ser, 1.0)
+
+    freq_mean_delta = np.full(len(freqs_hz), np.nan, dtype=np.float64)
+    freq_sem_delta = np.full(len(freqs_hz), np.nan, dtype=np.float64)
+
+    n_freqs = len(freqs_hz)
+    total_meas = n_freqs * N_REPEATS_PER_FREQ
+    est_runtime_s = total_meas * MEAS_TIMEOUT_S/6
+
+    print(
+        f"Planned run: {n_freqs} frequencies, "
+        f"{N_REPEATS_PER_FREQ} repeats/frequency, "
+        f"{total_meas} total measurements"
+    )
+    print(
+        f"Estimated worst-case runtime: "
+        f"{est_runtime_s / 60:.1f} min "
+        f"({est_runtime_s / 3600:.2f} hr)"
+    )
+    with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "freq_hz",
+            "repeat_idx",
+            "off1",
+            "on",
+            "off2",
+            "off_ref",
+            "delta_on_minus_offref",
+            "contrast_on_minus_offref_over_offref",
+            "drift_off2_minus_off1",
+        ])
+
+        try:
+            for fi, freq_hz in enumerate(freqs_hz):
+                print(f"\nRequesting measurements at {freq_hz / 1e9:.6f} GHz ...")
+
+                deltas_this_freq: List[float] = []
+
+                for repeat_idx in range(N_REPEATS_PER_FREQ):
+                    send_measurement_command(ser, freq_hz)
+
+                    result = wait_for_result(ser, freq_hz, timeout_s=MEAS_TIMEOUT_S)
+                    result_freq_hz, off1, on, off2, off_ref, delta, contrast, drift = result
+
+                    if np.isfinite(delta):
+                        deltas_this_freq.append(delta)
+
+                    w.writerow([
+                        f"{result_freq_hz:.0f}",
+                        repeat_idx,
+                        off1,
+                        on,
+                        off2,
+                        off_ref,
+                        delta,
+                        contrast,
+                        drift,
+                    ])
+                    f.flush()
+
+                    if PRINT_EACH_MEASUREMENT:
+                        print(
+                            f"  rep {repeat_idx + 1:2d}/{N_REPEATS_PER_FREQ} | "
+                            f"OFF1={off1:.6g} ON={on:.6g} OFF2={off2:.6g} "
+                            f"OFF_REF={off_ref:.6g} Δ={delta:+.3e} "
+                            f"contrast={contrast:+.3e} drift={drift:+.3e}"
+                        )
+
+                d = np.asarray(deltas_this_freq, dtype=np.float64)
+                if d.size > 0:
+                    freq_mean_delta[fi] = float(np.mean(d))
+                    if d.size > 1:
+                        freq_sem_delta[fi] = float(np.std(d, ddof=1) / np.sqrt(d.size))
+                    else:
+                        freq_sem_delta[fi] = 0.0
+
+                if PRINT_FREQ_SUMMARY:
+                    print(
+                        f"Freq {freq_hz / 1e9:.6f} GHz summary: "
+                        f"mean Δ = {freq_mean_delta[fi]:+.6e}, "
+                        f"SEM = {freq_sem_delta[fi]:.6e}, "
+                        f"n = {d.size}"
+                    )
+
+        finally:
+            print("\nClosing serial...")
+            try:
+                ser.close()
+            except Exception:
+                pass
+
+    print(f"Saved {CSV_PATH}")
+
+    valid = np.isfinite(freq_mean_delta)
+    if not np.any(valid):
+        print("No valid sweep points collected.")
+        return
+
+    print("\nSweep summary:")
+    for f_hz, d_mean, d_sem in zip(freqs_hz, freq_mean_delta, freq_sem_delta):
+        print(f"  {f_hz / 1e9:.6f} GHz : mean Δ = {d_mean:+.6e}, SEM = {d_sem:.6e}")
+
+    if PLOT:
+        plt.figure(figsize=(8, 5))
+        plt.errorbar(
+            freqs_hz[valid] / 1e9,
+            freq_mean_delta[valid],
+            yerr=freq_sem_delta[valid],
+            fmt="o-",
+            capsize=4,
+        )
+        plt.xlabel("Frequency (GHz)")
+        plt.ylabel("Mean Δ = ON - OFF_REF")
+        plt.title(f"ODMR sweep mean Δ vs frequency (n={N_REPEATS_PER_FREQ})")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+
+if __name__ == "__main__":
+    main()
+
